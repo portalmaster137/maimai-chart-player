@@ -29,18 +29,19 @@ pub enum StarKind {
 /// Slide shape, mirroring simai notation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlideShape {
-    Line,     // `-`
-    ArcRight, // `>`
-    ArcLeft,  // `<`
-    P,        // `p`
-    Q,        // `q`
-    PP,       // `pp`
-    QQ,       // `qq`
-    V,        // `v`
-    VBig,     // `V`
-    Z,        // `z`
-    S,        // `s`
-    W,        // `w`
+    Line,       // `-`
+    ArcRight,   // `>`
+    ArcLeft,    // `<`
+    AutoCircle, // `^` (shortest-direction ring arc)
+    P,          // `p`
+    Q,          // `q`
+    PP,         // `pp`
+    QQ,         // `qq`
+    V,          // `v`
+    VBig,       // `V` (L-shape via a turning-point button)
+    Z,          // `z`
+    S,          // `s`
+    W,          // `w` (fan / WiFi)
 }
 
 /// One leg of a (possibly chained) slide.
@@ -49,6 +50,8 @@ pub struct SlidePart {
     pub shape: SlideShape,
     pub from: u8,
     pub to: u8,
+    /// Turning-point button for the `V` (L-shape) slide; 0 = none.
+    pub turn: u8,
     /// Seconds after the star tap when this leg's motion begins.
     pub motion_start: f32,
     /// Seconds after the star tap when this leg's motion ends.

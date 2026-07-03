@@ -221,7 +221,7 @@ fn parse_ring_note(
 }
 
 fn is_shape_start(c: u8) -> bool {
-    matches!(c, b'-' | b'>' | b'<' | b'p' | b'q' | b'w' | b'v' | b'V' | b'z' | b's')
+    matches!(c, b'-' | b'>' | b'<' | b'^' | b'p' | b'q' | b'w' | b'v' | b'V' | b'z' | b's')
 }
 
 /// Parse a slide chain: legs separated by `*`, each group ends with `[dur]`.
@@ -243,8 +243,8 @@ fn parse_slide_chain(
     let mut cursor = time + if bpm > 0.0 { 60.0 / bpm } else { 0.5 };
 
     loop {
-        // Parse one group: one or more legs (shape + dst) then a bracket.
-        let mut legs: Vec<(SlideShape, u8)> = Vec::new();
+        // Parse one group: one or more legs (shape + dst + turn) then a bracket.
+        let mut legs: Vec<(SlideShape, u8, u8)> = Vec::new();
         loop {
             if i >= b.len() {
                 warnings.push(format!("slide ended before bracket: {s}"));
@@ -254,6 +254,7 @@ fn parse_slide_chain(
                 b'-' => SlideShape::Line,
                 b'>' => SlideShape::ArcRight,
                 b'<' => SlideShape::ArcLeft,
+                b'^' => SlideShape::AutoCircle,
                 b'p' => {
                     if b.get(i + 1) == Some(&b'p') {
                         i += 1;
@@ -286,15 +287,17 @@ fn parse_slide_chain(
             };
             i += 1;
             // `V` (big) shape carries a turning-point digit before the dest
-            // (e.g. `1V36` = V via turning point 3 to dest 6). Consume & ignore it.
+            // (e.g. `1V35` = V via turning point 3 to dest 5). Capture it.
+            let mut turn: u8 = 0;
             if shape == SlideShape::VBig && i < b.len() && (b'1'..=b'8').contains(&b[i]) {
+                turn = b[i] - b'0';
                 i += 1;
             }
             // Destination button digit.
             if i < b.len() && (b'1'..=b'8').contains(&b[i]) {
                 let dst = b[i] - b'0';
                 i += 1;
-                legs.push((shape, dst));
+                legs.push((shape, dst, turn));
             } else {
                 warnings.push(format!("slide missing dst in: {s}"));
                 break;
@@ -326,10 +329,10 @@ fn parse_slide_chain(
         // Distribute duration evenly across the group's legs.
         let n = legs.len().max(1);
         let leg_dur = dur / n as f32;
-        for (shape, dst) in legs {
+        for (shape, dst, turn) in legs {
             let motion_start = cursor;
             let motion_end = cursor + leg_dur;
-            parts.push(SlidePart { shape, from, to: dst, motion_start, motion_end });
+            parts.push(SlidePart { shape, from, to: dst, turn, motion_start, motion_end });
             cursor = motion_end;
             from = dst;
         }

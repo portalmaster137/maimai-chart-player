@@ -544,21 +544,25 @@ fn touch_angle(zone: Zone, idx: u8) -> f32 {
     }
 }
 
-/// Pick the shorter arc direction for `<` (ccw) and `>` (cw).
+/// Resolve the start/end screen angles for a ring-arc slide (`>`, `<`, `^`).
+/// `>`/`<` follow the start-lane flip rule: the arrow glyph's rotational meaning
+/// depends on which half of the playfield the slide starts from (upper half →
+/// `>` is clockwise / `<` counter-clockwise; lower half → flipped). `^` takes
+/// the shorter arc. Returns (a0, a1) with a0 = ang_from; a1 may be > 2π or < 0
+/// for long directed arcs (trig handles it).
 fn arc_direction(ang_from: f32, ang_to: f32, shape: SlideShape) -> (f32, f32) {
-    // Normalize delta to (-2π, 2π).
-    let mut delta = ang_to - ang_from;
-    while delta > std::f32::consts::PI {
-        delta -= 2.0 * std::f32::consts::PI;
-    }
-    while delta < -std::f32::consts::PI {
-        delta += 2.0 * std::f32::consts::PI;
-    }
-    match shape {
-        SlideShape::ArcRight => (ang_from, ang_from + delta.abs()), // clockwise
-        SlideShape::ArcLeft => (ang_from, ang_from - delta.abs()),  // counter-clockwise
-        _ => (ang_from, ang_from + delta),
-    }
+    let two_pi = 2.0 * std::f32::consts::PI;
+    let cw_dist = (ang_to - ang_from).rem_euclid(two_pi);  // clockwise distance
+    let ccw_dist = (ang_from - ang_to).rem_euclid(two_pi); // counter-clockwise
+    let upper = ang_from.sin() < 0.0; // start in the top half of the playfield
+    let (cw, dist) = match shape {
+        SlideShape::ArcRight => (upper, if upper { cw_dist } else { ccw_dist }),
+        SlideShape::ArcLeft => (!upper, if !upper { cw_dist } else { ccw_dist }),
+        SlideShape::AutoCircle => (cw_dist <= ccw_dist, cw_dist.min(ccw_dist)),
+        _ => (true, cw_dist),
+    };
+    let a1 = if cw { ang_from + dist } else { ang_from - dist };
+    (ang_from, a1)
 }
 
 /// Glyph for a note body (color is resolved separately by `note_color`).
@@ -693,75 +697,210 @@ fn put_disc(cells: &mut [Cell], width: i32, height: i32, c: i32, r: i32, rrows: 
     }
 }
 
+/// One piece of a slide path. Coordinates are in canvas cells (col, row); arc
+/// angles are screen radians around the playfield center.
+#[derive(Clone, Copy)]
+enum Seg {
+    /// Straight chord from (fc, fr) to (tc, tr).
+    Line(f32, f32, f32, f32),
+    /// Elliptical arc on the playfield, centered (cxc, cyr) with col/row radii
+    /// (rc, rr), from screen angle a0 to a1 (a1 may exceed 2π / be negative for
+    /// directed long arcs).
+    Arc { cxc: f32, cyr: f32, rc: f32, rr: f32, a0: f32, a1: f32 },
+}
+
+/// Wrap a button index into 1..=8 (0 → 8, 9 → 1).
+fn wrap1_8(b: u8) -> u8 {
+    if b == 0 { 8 } else if b > 8 { 1 } else { b }
+}
+
+/// Geometric length of a segment in cell-ish units (rows count double for the
+/// ~2:1 char aspect), used only to spread samples proportionally.
+fn seg_len(s: &Seg) -> f32 {
+    match s {
+        Seg::Line(fc, fr, tc, tr) => {
+            let dc = tc - fc;
+            let dr = (tr - fr) * 2.0;
+            (dc * dc + dr * dr).sqrt()
+        }
+        Seg::Arc { rc, rr, a0, a1, .. } => {
+            let da = (a1 - a0).abs();
+            // average aspect-corrected radius × swept angle
+            let avg = ((rc + rr * 2.0) / 2.0).max(1.0);
+            avg * da
+        }
+    }
+}
+
+/// Position (col, row) and continuous travel direction (dc, dr) at parameter
+/// `t ∈ [0,1]` along a segment. Direction is in raw cell units (the caller
+/// applies the 2:1 aspect when orienting arrows).
+fn seg_point_dir(s: &Seg, t: f32) -> (f32, f32, f32, f32) {
+    match s {
+        Seg::Line(fc, fr, tc, tr) => {
+            let c = fc + (tc - fc) * t;
+            let r = fr + (tr - fr) * t;
+            (c, r, tc - fc, tr - fr)
+        }
+        Seg::Arc { cxc, cyr, rc, rr, a0, a1 } => {
+            let a = a0 + (a1 - a0) * t;
+            let c = cxc + rc * a.cos();
+            let r = cyr + rr * a.sin();
+            // Tangent d(pos)/dt; sign follows (a1 - a0).
+            let da = a1 - a0;
+            let dc = -rc * a.sin() * da;
+            let dr = rr * a.cos() * da;
+            (c, r, dc, dr)
+        }
+    }
+}
+
+/// Build the geometric segments for one slide leg, per the simai shape spec.
+/// `B(b)` = button cell, `I(θ)` = inner-ring point at angle θ, `R` = outer ring.
+fn slide_segments(r: &Renderer, part: &crate::chart::SlidePart) -> Vec<Seg> {
+    let cx = r.cx;
+    let cy = r.cy;
+    let rc = r.r_cols;
+    let rr = r.r_rows;
+    let bpt = |b: u8| -> (f32, f32) {
+        let (c, ro) = r.button_pos[b as usize];
+        (c as f32, ro as f32)
+    };
+    let ang_from = button_angle(part.from);
+    let ang_to = button_angle(part.to);
+    let two_pi = 2.0 * std::f32::consts::PI;
+
+    let (fc, fr) = bpt(part.from);
+    let (tc, tr) = bpt(part.to);
+
+    match part.shape {
+        SlideShape::Line => vec![Seg::Line(fc, fr, tc, tr)],
+
+        SlideShape::ArcRight | SlideShape::ArcLeft | SlideShape::AutoCircle => {
+            let (a0, a1) = arc_direction(ang_from, ang_to, part.shape);
+            vec![Seg::Arc { cxc: cx, cyr: cy, rc, rr, a0, a1 }]
+        }
+
+        // V-shape: polyline bending through the center.
+        SlideShape::V => vec![
+            Seg::Line(fc, fr, cx, cy),
+            Seg::Line(cx, cy, tc, tr),
+        ],
+
+        // L-shape: polyline bending through the turning-point button (fall back
+        // to a V through the center if the turning digit is missing).
+        SlideShape::VBig => {
+            if part.turn == 0 {
+                vec![Seg::Line(fc, fr, cx, cy), Seg::Line(cx, cy, tc, tr)]
+            } else {
+                let (mc, mr) = bpt(part.turn);
+                vec![Seg::Line(fc, fr, mc, mr), Seg::Line(mc, mr, tc, tr)]
+            }
+        }
+
+        // U-loop around the center on a small (p/q) or large (pp/qq) inner ring.
+        // `p` = ccw, `q` = cw; the loop covers the directed distance from→to.
+        SlideShape::P | SlideShape::Q | SlideShape::PP | SlideShape::QQ => {
+            let (ri_c, ri_r) = match part.shape {
+                SlideShape::PP | SlideShape::QQ => (rc * 0.60, rr * 0.60),
+                _ => (rc * 0.30, rr * 0.30),
+            };
+            let cw = matches!(part.shape, SlideShape::Q | SlideShape::QQ);
+            let dist = if cw {
+                (ang_to - ang_from).rem_euclid(two_pi)
+            } else {
+                (ang_from - ang_to).rem_euclid(two_pi)
+            };
+            let a1 = if cw { ang_from + dist } else { ang_from - dist };
+            let ifrom = (cx + ri_c * ang_from.cos(), cy + ri_r * ang_from.sin());
+            let ito = (cx + ri_c * ang_to.cos(), cy + ri_r * ang_to.sin());
+            vec![
+                Seg::Line(fc, fr, ifrom.0, ifrom.1),
+                Seg::Arc { cxc: cx, cyr: cy, rc: ri_c, rr: ri_r, a0: ang_from, a1 },
+                Seg::Line(ito.0, ito.1, tc, tr),
+            ]
+        }
+
+        // Thunder zigzag: 3-segment polyline with perpendicular offsets that
+        // alternate sign between `s` (ccw bulge) and `z` (cw, mirrored).
+        SlideShape::S | SlideShape::Z => {
+            let vx = tc - fc;
+            let vy = tr - fr;
+            // Perpendicular to the chord, aspect-aware (rows count double).
+            let pc = -vy * 2.0;
+            let pr = vx / 2.0;
+            let plen = (pc * pc + (pr * 2.0) * (pr * 2.0)).sqrt().max(1e-6);
+            let d = 0.25 * (vx * vx + (vy * 2.0) * (vy * 2.0)).sqrt();
+            let sgn = if matches!(part.shape, SlideShape::S) { 1.0 } else { -1.0 };
+            let off_c = sgn * pc / plen * d;
+            let off_r = sgn * pr / plen * d;
+            let p1 = (fc + vx / 3.0 + off_c, fr + vy / 3.0 + off_r);
+            let p2 = (fc + 2.0 * vx / 3.0 - off_c, fr + 2.0 * vy / 3.0 - off_r);
+            vec![
+                Seg::Line(fc, fr, p1.0, p1.1),
+                Seg::Line(p1.0, p1.1, p2.0, p2.1),
+                Seg::Line(p2.0, p2.1, tc, tr),
+            ]
+        }
+
+        // Fan / WiFi: a stem from `from` straight to button `to−1`, then a ring
+        // arc sweeping `to−1` → `to+1` through `to` (covers the 3-lane fan).
+        SlideShape::W => {
+            let tm1 = wrap1_8(part.to.wrapping_sub(1));
+            let tp1 = wrap1_8(part.to.wrapping_add(1));
+            let (mc, mr) = bpt(tm1);
+            let ang_m = button_angle(tm1);
+            let ang_p = button_angle(tp1);
+            // Short arc through `to` (tm1, to, tp1 are consecutive clockwise).
+            let cw_dist = (ang_p - ang_m).rem_euclid(two_pi);
+            let ccw_dist = (ang_m - ang_p).rem_euclid(two_pi);
+            let (a0, a1) = if cw_dist <= ccw_dist {
+                (ang_m, ang_m + cw_dist)
+            } else {
+                (ang_m, ang_m - ccw_dist)
+            };
+            vec![
+                Seg::Line(fc, fr, mc, mr),
+                Seg::Arc { cxc: cx, cyr: cy, rc, rr, a0, a1 },
+            ]
+        }
+    }
+}
+
 /// Sample one slide leg into a connected list of (col, row, dir_c, dir_r)
 /// tuples from `from`→`to`. The direction is the continuous travel direction
 /// at that point (in cell units, before aspect correction) so arrows orient
-/// smoothly even on diagonals.
+/// smoothly even on diagonals and across segment joins.
 fn sample_path(r: &Renderer, part: &crate::chart::SlidePart) -> Vec<(i32, i32, f32, f32)> {
-    let (from_c, from_r) = r.button_pos[part.from as usize];
-    let (to_c, to_r) = r.button_pos[part.to as usize];
-    // Estimate path length in cells to pick a sample count that stays connected.
-    let len = match part.shape {
-        SlideShape::ArcRight | SlideShape::ArcLeft => {
-            let ang_from = button_angle(part.from);
-            let ang_to = button_angle(part.to);
-            let (_, a1) = arc_direction(ang_from, ang_to, part.shape);
-            let ang = (a1 - ang_from).abs();
-            (r.r_cols * ang).max(r.r_rows * ang)
-        }
-        _ => {
-            let dc = to_c - from_c;
-            let dr = (to_r - from_r) * 2; // aspect
-            ((dc * dc + dr * dr) as f32).sqrt()
-        }
-    };
-    let n = (len.ceil() as i32 + 2).max(8) as usize;
-    let mut pts = Vec::with_capacity(n + 1);
+    let segs = slide_segments(r, part);
+    if segs.is_empty() {
+        return Vec::new();
+    }
+    let total: f32 = segs.iter().map(seg_len).sum();
+    if total <= 0.0 {
+        return Vec::new();
+    }
+    // Overall sample resolution tied to path length so curves stay connected.
+    let n_total = (total.ceil() as i32 + 2).max(8) as usize;
+    let mut pts: Vec<(i32, i32, f32, f32)> = Vec::with_capacity(n_total + segs.len());
     let mut prev: Option<(i32, i32)> = None;
-    for k in 0..=n {
-        let p = k as f32 / n as f32;
-        let (cc, rr, dc, dr) = point_and_dir(r, part, p, from_c, from_r, to_c, to_r);
-        if prev != Some((cc, rr)) {
-            pts.push((cc, rr, dc, dr));
-            prev = Some((cc, rr));
+    for s in &segs {
+        let sl = seg_len(s);
+        if sl <= 0.0 {
+            continue;
+        }
+        let n = ((n_total as f32) * sl / total).round().max(2.0) as usize;
+        for k in 0..=n {
+            let t = k as f32 / n as f32;
+            let (c, ro, dc, dr) = seg_point_dir(s, t);
+            let cell = (c.round() as i32, ro.round() as i32);
+            if prev != Some(cell) {
+                pts.push((cell.0, cell.1, dc, dr));
+                prev = Some(cell);
+            }
         }
     }
     pts
-}
-
-/// Position and continuous travel direction along a leg at progress p ∈ [0,1].
-fn point_and_dir(
-    r: &Renderer,
-    part: &crate::chart::SlidePart,
-    p: f32,
-    from_c: i32,
-    from_r: i32,
-    to_c: i32,
-    to_r: i32,
-) -> (i32, i32, f32, f32) {
-    match part.shape {
-        SlideShape::ArcRight | SlideShape::ArcLeft => {
-            let ang_from = button_angle(part.from);
-            let ang_to = button_angle(part.to);
-            let (a0, a1) = arc_direction(ang_from, ang_to, part.shape);
-            let a = a0 + (a1 - a0) * p;
-            let c = r.cx + r.r_cols * a.cos();
-            let row = r.cy + r.r_rows * a.sin();
-            // Tangent d(pos)/dp along the arc (direction of increasing p).
-            let da = a1 - a0;
-            let dc = -r.r_cols * a.sin() * da;
-            let dr = r.r_rows * a.cos() * da;
-            (c.round() as i32, row.round() as i32, dc, dr)
-        }
-        _ => {
-            let c = from_c as f32 + (to_c as f32 - from_c as f32) * p;
-            let row = from_r as f32 + (to_r as f32 - from_r as f32) * p;
-            // Straight chord: constant direction.
-            let dc = (to_c - from_c) as f32;
-            let dr = (to_r - from_r) as f32;
-            (c.round() as i32, row.round() as i32, dc, dr)
-        }
-    }
 }
 
 /// Truncate a string to at most `max_chars` visible chars, on a UTF-8 char

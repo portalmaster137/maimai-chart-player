@@ -38,9 +38,10 @@ Dependencies: `rodio` (symphonia-mp3), `crossterm`, `clap` (derive).
 - **Tokens** (per slot, `/`-separated = simultaneous EACH):
   - Tap: `1..8` + `b`(break)/`x`(EX)/`$`/`$$`(star). Adjacent `12,` = simultaneous.
   - Hold: `Nh[A:B]` (+`b`/`x`). dur = `B * 240/(bpm*A)`. `Nh[#s]` = absolute secs.
-  - Slide: `<src><shape><dst>[A:B]`, shapes `- > < p q w v V z s` (+`pp`/`qq`),
-    `*` chains, multi-point `a-b-c`. Star tap at `time`; **motion starts one
-    quarter note later** = `time + 60/bpm`; lasts bracket duration.
+  - Slide: `<src><shape><dst>[A:B]`, shapes `- > < ^ p q w v V z s` (+`pp`/`qq`),
+    `V` carries a turning-point digit (`aVbc` = via `b` to `c`). `*` chains,
+    multi-point `a-b-c`. Star tap at `time`; **motion starts one quarter note
+    later** = `time + 60/bpm`; lasts bracket duration.
   - Touch: `A1..A8 B1..B8 D1..D8 E1..E8 C`. `f`=firework. `Ch[A:B]`=center hold.
 - End marker: line containing `E`.
 
@@ -84,14 +85,37 @@ Dependencies: `rodio` (symphonia-mp3), `crossterm`, `clap` (derive).
   5. default tap → **pink** (256-color `\x1b[38;5;213m`).
   Firework touches are yellow. `simultaneous_flags` groups sorted events by equal
   `time` and marks groups of ≥2.
-- **Star slides fade in then trace:** each leg samples a connected cell path
-  (`sample_path` → (col,row,dir_c,dir_r)). The path is drawn as **little arrows**
-  (`arrow_for`) oriented along the continuous travel direction (8 octants, aspect-
-  corrected): `> < ^ v ↘↙↖↗`. During `[motion_start-FADE_IN, motion_start]` the
-  full path fades in as dim arrows (gray→dim-blue). During `[motion_start,
-  motion_end]` the star head (`★` disc, blue/orange/yellow) travels start→end;
-  arrows behind it light up bright (blue, or orange if break) and stay lit,
-  arrows ahead stay dim.
+- **Star slides fade in then trace:** each leg builds a list of geometric
+  **segments** (`slide_segments` → `Seg::Line` / `Seg::Arc`), samples them into a
+  connected cell path (`sample_path` → (col,row,dir_c,dir_r)) proportional to each
+  segment's length, and is drawn as **little arrows** (`arrow_for`) oriented along
+  the continuous travel direction (8 octants, aspect-corrected): `> < ^ v ↘↙↖↗`.
+  During `[motion_start-FADE_IN, motion_start]` the full path fades in as dim
+  arrows (gray→dim-blue). During `[motion_start, motion_end]` the star head
+  (`★` disc, blue/orange/yellow) travels start→end; arrows behind it light up
+  bright (blue, or orange if break) and stay lit, arrows ahead stay dim.
+- **Slide shape geometry** (per simai spec; `B(b)`=button cell, `I(θ)`=inner-ring
+  point, `R`=outer ring radius):
+  - `-` straight chord `B(from)→B(to)`.
+  - `>`/`<` ring **arc**, directed by the **start-lane flip rule**: start in the
+    upper half (`button_angle(from).sin() < 0`) → `>` clockwise / `<` ccw; lower
+    half → flipped. Arc length = the directed distance (can exceed 180° — e.g.
+    `1<4` sweeps ccw 225° through 8/7/6/5, the long way).
+  - `^` auto ring arc — **shortest** direction.
+  - `v` V-shape: polyline `B(from)→center→B(to)`.
+  - `V` L-shape: polyline `B(from)→B(turn)→B(to)` via the turning-point button
+    (`turn` field; falls back to `v` if absent).
+  - `p`/`q` U-loop: `B(from)→I(from)`, inner-ring arc (radius `0.30·R`, ccw for
+    `p` / cw for `q`, directed distance), `I(to)→B(to)`.
+  - `pp`/`qq` CUP: same as `p`/`q` but inner-ring radius `0.60·R` (bigger loop).
+  - `s`/`z` thunder zigzag: 3-segment polyline `B(from)→P1→P2→B(to)` with
+    perpendicular offset `0.25·|chord|`; `s` bulges one way, `z` mirrored.
+  - `w` fan/WiFi: stem `B(from)→B(to−1)` then a ring arc `B(to−1)→B(to+1)`
+    through `to` (the short 90° sweep covering 3 lanes).
+  Arc tangent for arrow orientation: `(−rc·sin a·da, rr·cos a·da)` with
+  `da = a1−a0`. These are terminal approximations of maimai's true curves
+  (especially `w`/`p`/`q`/`pp`/`qq`/`s`/`z`), but each now renders its
+  distinctive shape instead of collapsing to a straight chord.
 - **Touch notes are shutters, not center travelers.** A touch appears at its own
   zone position as a small square shutter: four pyramids (▲▼◀▶) around the hit
   point that close in as `p→1` (open at the square's edges, tips meet at hit),
@@ -127,7 +151,10 @@ Dependencies: `rodio` (symphonia-mp3), `crossterm`, `clap` (derive).
 - [x] render: tap outward-travel + flash
 - [x] render: break/EX/star colors+glyphs
 - [x] render: hold sustained marker
-- [x] render: slide moving star + path (straight chord + ring arc for >/<)
+- [x] render: slide moving star + path (segment-based geometry: `-` line,
+      `>`/`<`/`^` ring arcs with flip-rule/shortest direction, `v` V through
+      center, `V` L through turning button, `p`/`q`/`pp`/`qq` U/CUP loops on
+      inner ring, `s`/`z` thunder zigzag, `w` fan/WiFi stem+arc sweep)
 - [x] render: touch zones (inner ring, green + / yellow F firework)
 - [x] player: rodio audio playback + master clock (audio optional via --no-audio)
 - [x] player: 60fps sync loop + key handling + terminal restore (TermGuard)
@@ -166,11 +193,25 @@ Dependencies: `rodio` (symphonia-mp3), `crossterm`, `clap` (derive).
   break=orange[208], single touch=blue[94], simultaneous 4-touch=yellow[93] (no
   pink/orange/blue leak); slide arrows oriented correctly (horizontal 2→6=`<`,
   diagonal 1→5=`↙`, arc 1→4 curves `↙→v→↘`).
+- **Slide shapes verified via `--demo` at mid-trace times** (temp `DEMO_NOW` hook,
+  since removed): `1<4` sweeps ccw 225° through 8/7/6/5 (flip-rule long way, not
+  the old short arc); `2V46` L-bends at button 4 (down the right side then across
+  the bottom, `turn=4` carried from parser); `3v2` bends through the center;
+  `6pp4` traces an inner-ring U-dip (radius 0.60·R); `1w5` renders the fan —
+  `v` stem down the right (1→4) curving into `↖` sweep across 4→5→6, star at the
+  junction. `--dump -d 6` confirms the `V` turning digit parses (`2V46` →
+  `turn: 4, to: 6`) and `^`/`AutoCircle` parses. No `s`/`z`/`^`/`p`/`q`/`qq` in
+  the test chart, so those shapes are verified by geometry/code review only.
 
 ## Known simplifications
 - Touch zones mapped to inner ring at button angles (not exact maimai geometry).
-- Slide path shapes approximated (straight line + ring-arc for `>`/`<`); full
-  p/q/w/v/V/z geometry approximated as straight or arc.
+- Slide path shapes are terminal approximations of maimai's true curves:
+  `>`/`<`/`^`/`-` are exact (ring arc / chord); `v`/`V` are exact polylines;
+  `p`/`q`/`pp`/`qq` model the loop as an inner-ring arc at the directed distance
+  (radius 0.30·R / 0.60·R) rather than the true maimai U/CUP spline; `s`/`z` are
+  a 3-segment zigzag with a fixed 0.25·|chord| offset; `w` is a stem + 90° ring
+  sweep (3 lanes) rather than the true fan spline. Each renders its distinctive
+  shape instead of collapsing to a straight chord.
 - Seek/scrub not supported in v1 (mp3 decode seek is non-trivial).
 
 ## Gotchas
