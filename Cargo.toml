@@ -1,0 +1,13 @@
+[package]
+name = "maimai-player"
+version = "0.1.0"
+edition = "2024"
+description = "A terminal maimai chart player that visualizes simai charts in sync with audio."
+
+[dependencies]
+rodio = { version = "0.20", features = ["symphonia-mp3"] }
+crossterm = "0.28"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 2
