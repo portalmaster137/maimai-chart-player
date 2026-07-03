@@ -104,4 +104,4 @@ pub struct DifficultyInfo {
     pub present: bool,  // has an &inote_N block
 }
 
-pub const DIFFICULTY_NAMES: [&str; 7] = ["", "EZ", "STD", "HRD", "MAST", "REIM", "UPR"];
+pub const DIFFICULTY_NAMES: [&str; 7] = ["", "EZ", "STD", "ADV", "EXP", "MAS", "REMAS"];

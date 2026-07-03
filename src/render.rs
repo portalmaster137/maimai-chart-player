@@ -13,6 +13,7 @@ enum Color {
     Orange,    // break notes (256-color bright orange)
     Magenta,   // EX notes
     Yellow,    // simultaneous (≥2 at same time) + firework
+    White,     // touch-note hit border (bright white)
     Rainbow(u8), // touch-holds: index into RAINBOW (24-step hue wheel)
 }
 
@@ -38,6 +39,7 @@ impl Color {
             Color::Orange => "\x1b[38;5;208m",
             Color::Magenta => "\x1b[95m",
             Color::Yellow => "\x1b[93m",
+            Color::White => "\x1b[97m",
             Color::Rainbow(i) => RAINBOW[(i as usize) % RAINBOW.len()],
         }
     }
@@ -86,6 +88,9 @@ const STAR_R: f32 = 1.3; // star tap
 const TOUCH_HOLD_R: f32 = 1.7; // touch-hold body (center C) — nice and big
 const HOLD_RING_R: f32 = 2.6; // touch-hold timer ring row-radius (around the body)
 const FLASH_R: f32 = 1.7; // enlarged disc at hit time
+// Fan (`w`) slide ray thickness (in rows; col radius ≈ 2× this). Thick filled
+// `●` bars so the fan reads as a bold solid shape rather than a thin line.
+const RAY_R: f32 = 0.9;
 // Touch "shutter": four pyramids around the touch point that close in to the
 // hit timing. Half-size of the shutter square (rows / cols, 2:1 aspect).
 const SHUTTER_R: f32 = 2.0;
@@ -98,8 +103,6 @@ pub struct Renderer {
     cy: f32,
     r_cols: f32,
     r_rows: f32,
-    inner_cols: f32,
-    inner_rows: f32,
     r0_cols: f32,
     r0_rows: f32,
     static_layer: Vec<Cell>,
@@ -121,8 +124,6 @@ impl Renderer {
         let by_width = ((width as f32 / 4.0) - 1.0).floor();
         let r_rows = by_height.min(by_width).max(4.0);
         let r_cols = r_rows * 2.0;
-        let inner_cols = r_cols * 0.45;
-        let inner_rows = r_rows * 0.45;
         let r0_cols = r_cols * 0.12; // "near the center but not exactly"
         let r0_rows = r_rows * 0.12;
 
@@ -139,9 +140,13 @@ impl Renderer {
         }
 
         let mut static_layer = vec![Cell::default(); (width * height) as usize];
-        // Clean outer + inner ellipse outlines (2 points per row → connected circle).
+        // Concentric reference rings: outer button ring + the 3 touch sensor
+        // rings (A/D outer ~0.80R, E middle ~0.60R, B inner ~0.45R), matching
+        // the 5 maimai touch zones (C is the center marker drawn next).
         draw_ellipse(&mut static_layer, width, height, cx, cy, r_cols, r_rows, '.', Color::Dim);
-        draw_ellipse(&mut static_layer, width, height, cx, cy, inner_cols, inner_rows, ',', Color::Dim);
+        draw_ellipse(&mut static_layer, width, height, cx, cy, r_cols * 0.80, r_rows * 0.80, '·', Color::Dim); // A/D
+        draw_ellipse(&mut static_layer, width, height, cx, cy, r_cols * 0.60, r_rows * 0.60, '∘', Color::Dim); // E
+        draw_ellipse(&mut static_layer, width, height, cx, cy, r_cols * 0.45, r_rows * 0.45, ',', Color::Dim); // B
         // Center marker.
         put(&mut static_layer, width, height, cx as i32, cy as i32, 'C', Color::Dim);
         // Button labels sit on the outer ring (overwrite the dot at that cell).
@@ -157,8 +162,6 @@ impl Renderer {
             cy,
             r_cols,
             r_rows,
-            inner_cols,
-            inner_rows,
             r0_cols,
             r0_rows,
             static_layer,
@@ -234,24 +237,38 @@ impl Renderer {
                 }
             }
             Kind::Hold { end, brk, ex } => {
-                self.draw_tap(cells, ev, now, window, *brk, *ex, StarKind::None, sim, false);
-                // During [time, end] the hold extends as a bar from the button
-                // inward toward the center, retracting as time elapses (the bar's
-                // length = remaining fraction of the hold). At hit the bar is full;
-                // at end it has retracted to just the head disc at the button.
-                if now >= ev.time && now <= *end && matches!(ev.pos, Position::Button(_)) {
+                // The hold bar appears the moment the note spawns and grows with
+                // the approaching head: during approach it grows from the spawn
+                // point toward the button (head at its tip), is full at hit,
+                // then retracts toward the button over the hold duration. Ring
+                // holds only (touch holds are `Kind::TouchHold`).
+                let is_ring = matches!(ev.pos, Position::Button(_));
+                if is_ring {
                     let (tc, tr, sc, sr, _, _) = self.spawn_target(ev.pos);
                     let color = note_color(*brk, *ex, StarKind::None, sim, false);
                     let rdisc = if *brk { BREAK_R } else { NOTE_R };
-                    let dur = (*end - ev.time).max(0.001);
-                    let p = ((now - ev.time) / dur).clamp(0.0, 1.0);
-                    let frac = 1.0 - p; // remaining hold → bar length
-                    self.draw_hold_tail(cells, tc, tr, sc, sr, frac, rdisc * 0.7, color);
-                    // Head disc at the button (skip during the brief flash window
-                    // so draw_tap's flash glyph stays visible at the hit moment).
-                    if now > ev.time + FLASH {
-                        put_disc(cells, self.width, self.height, tc, tr, rdisc, '●', color);
+                    let tcf = tc as f32;
+                    let trf = tr as f32;
+                    if now >= ev.time - window && now < ev.time {
+                        // Approach: bar grows from spawn toward the head.
+                        let p_a = ((now - (ev.time - window)) / window).clamp(0.0, 1.0);
+                        self.draw_bar(cells, sc, sr, tcf, trf, p_a, rdisc * 0.7, color);
+                    } else if now >= ev.time && now <= *end {
+                        // Hold: bar retracts from full (button→spawn) to 0.
+                        let dur = (*end - ev.time).max(0.001);
+                        let p = ((now - ev.time) / dur).clamp(0.0, 1.0);
+                        self.draw_bar(cells, tcf, trf, sc, sr, 1.0 - p, rdisc * 0.7, color);
                     }
+                }
+                // Head/flash on top of the bar: approach travel + hit flash.
+                self.draw_tap(cells, ev, now, window, *brk, *ex, StarKind::None, sim, false);
+                // Sustained head disc at the button after the flash fades, held
+                // through the hold's end (draw_tap returns early past t+FLASH).
+                if is_ring && now > ev.time + FLASH && now <= *end {
+                    let (tc, tr, _, _, _, _) = self.spawn_target(ev.pos);
+                    let color = note_color(*brk, *ex, StarKind::None, sim, false);
+                    let rdisc = if *brk { BREAK_R } else { NOTE_R };
+                    put_disc(cells, self.width, self.height, tc, tr, rdisc, '●', color);
                 }
             }
             Kind::TouchHold { end, firework } => {
@@ -279,7 +296,12 @@ impl Renderer {
                 // Each leg: full path fades in, then the star traces it out.
                 let head_color = note_color(*brk, *ex, *star, sim, false);
                 for part in parts {
-                    self.draw_slide_leg(cells, part, now, *brk, head_color);
+                    if part.shape == SlideShape::W {
+                        // Fans split into three expanding rays (see `draw_fan`).
+                        self.draw_fan(cells, part, now, head_color);
+                    } else {
+                        self.draw_slide_leg(cells, part, now, *brk, head_color);
+                    }
                 }
             }
         }
@@ -340,8 +362,9 @@ impl Renderer {
         // Firework or simultaneous touches are yellow; otherwise blue.
         let color = if firework || sim { Color::Yellow } else { Color::Blue };
         if now >= t {
-            // Hit: hold the shutter closed briefly, then it goes away.
-            self.draw_shutter(cells, target_c, target_r, 1.0, color);
+            // Hit: flash a white border (closed shutter in bright white) to
+            // mark the moment you're meant to hit, then it goes away.
+            self.draw_shutter(cells, target_c, target_r, 1.0, Color::White);
             return;
         }
         // Approach: four pyramids close in toward the touch point.
@@ -427,17 +450,92 @@ impl Renderer {
         put_disc(cells, self.width, self.height, hc, hr, STAR_R, '★', head_color);
     }
 
+    /// Draw a fan (Wi-Fi / `w`) slide: three rays from the source button `from`
+    /// out to the three consecutive destination sensors `to−1`, `to`, `to+1`.
+    /// The star splits at the source and the three rays expand outward
+    /// simultaneously — a big opening fan — reaching full extension at
+    /// `motion_end`, where the three destination sensors flash. Rays are thick
+    /// filled `●` bars (bright for the traveled portion, dim ahead of the
+    /// leading tip); a bright `★` hub sits at the source and a `★` head rides
+    /// each tip. Color comes from `head_color` (blue/orange/yellow); the dim
+    /// remainder uses `dim(head_color)`.
+    fn draw_fan(&self, cells: &mut [Cell], part: &crate::chart::SlidePart, now: f32, head_color: Color) {
+        let tm1 = wrap1_8(part.to.wrapping_sub(1));
+        let tp1 = wrap1_8(part.to.wrapping_add(1));
+        let dests = [tm1, part.to, tp1];
+        let (fc, fr) = self.button_pos[part.from as usize];
+        let (fc, fr) = (fc as f32, fr as f32);
+        let dimc = dim(head_color);
+
+        // Phase 1 — fade-in: the full three-ray fan appears dimly before motion.
+        if now < part.motion_start {
+            let fade_start = part.motion_start - FADE_IN;
+            if now < fade_start {
+                return;
+            }
+            let fp = ((now - fade_start) / FADE_IN).clamp(0.0, 1.0);
+            let c = if fp < 0.5 { Color::Dim } else { dimc };
+            for d in dests {
+                let (tc, tr) = self.button_pos[d as usize];
+                self.draw_bar(cells, fc, fr, tc as f32, tr as f32, 1.0, RAY_R, c);
+            }
+            put(cells, self.width, self.height, fc.round() as i32, fr.round() as i32, '★', c);
+            return;
+        }
+
+        // Past the fan's life: nothing to draw.
+        if now > part.motion_end + FLASH {
+            return;
+        }
+
+        let dur = (part.motion_end - part.motion_start).max(0.001);
+        let p = ((now - part.motion_start) / dur).clamp(0.0, 1.0);
+        // Hold the fully-open fan through [motion_end, motion_end + FLASH] so the
+        // three-sensor landing reads as a deliberate climax, not a flicker.
+        let fully_open = now >= part.motion_end;
+        let traced = if fully_open { 1.0 } else { p };
+
+        for d in dests {
+            let (tc, tr) = self.button_pos[d as usize];
+            let (tc, tr) = (tc as f32, tr as f32);
+            let tipc = fc + (tc - fc) * traced;
+            let tipr = fr + (tr - fr) * traced;
+            // Bright traveled portion: source → tip.
+            self.draw_bar(cells, fc, fr, tipc, tipr, 1.0, RAY_R, head_color);
+            if !fully_open {
+                // Dim remainder: tip → destination, with a star head at the tip.
+                self.draw_bar(cells, tipc, tipr, tc, tr, 1.0, RAY_R, dimc);
+                put(cells, self.width, self.height, tipc.round() as i32, tipr.round() as i32, '★', head_color);
+            }
+        }
+        // Bright hub at the source — the fan's pivot.
+        put(cells, self.width, self.height, fc.round() as i32, fr.round() as i32, '★', head_color);
+
+        if fully_open {
+            // The fan has opened onto three sensors — flash each one big.
+            for d in dests {
+                let (tc, tr) = self.button_pos[d as usize];
+                put_disc(cells, self.width, self.height, tc, tr, FLASH_R, '✦', head_color);
+            }
+        }
+    }
+
     /// Draw a hold's tail: a bar of filled discs from the button (tc,tr) inward
     /// toward the spawn point (sc,sr), covering `frac` of that distance (the
     /// remaining hold fraction). The button cell itself is left untouched so the
     /// head/flash glyph there is preserved. `rrows` sets the bar thickness.
-    fn draw_hold_tail(
+    /// Stamp `frac` of the segment from `(from_c, from_r)` toward `(to_c, to_r)`
+    /// as a chain of `●` discs (radius `rrows`, aspect-corrected). `frac` ∈
+    /// (0, 1] controls how much of the span is filled: 1.0 = full bar, 0.5 =
+    /// half from the `from` end. Used for hold bars (grow during approach,
+    /// retract during hold).
+    fn draw_bar(
         &self,
         cells: &mut [Cell],
-        tc: i32,
-        tr: i32,
-        sc: f32,
-        sr: f32,
+        from_c: f32,
+        from_r: f32,
+        to_c: f32,
+        to_r: f32,
         frac: f32,
         rrows: f32,
         color: Color,
@@ -445,15 +543,15 @@ impl Renderer {
         if frac <= 0.0 {
             return;
         }
-        let dc = sc - tc as f32;
-        let dr = sr - tr as f32;
+        let dc = to_c - from_c;
+        let dr = to_r - from_r;
         // Cell-distance estimate (cols dominate at 2:1 aspect); step ~0.5 cell.
         let dist = dc.abs().max(dr.abs() * 2.0).max(1.0);
         let n = ((dist * frac) * 2.0).ceil() as i32;
         for i in 1..=n {
             let t = (i as f32 / n as f32) * frac; // (0, frac]
-            let c = tc as f32 + dc * t;
-            let r = tr as f32 + dr * t;
+            let c = from_c + dc * t;
+            let r = from_r + dr * t;
             put_disc(cells, self.width, self.height, c.round() as i32, r.round() as i32, rrows, '●', color);
         }
     }
@@ -497,9 +595,9 @@ impl Renderer {
                     // Center touch (hold) sits exactly at C — no inner-ring offset.
                     return (self.cx as i32, self.cy as i32, self.cx as f32, self.cy as f32, 0.0, 0.0);
                 }
-                let ang = touch_angle(zone, idx);
-                let tc = (self.cx + self.inner_cols * ang.cos()).round() as i32;
-                let tr = (self.cy + self.inner_rows * ang.sin()).round() as i32;
+                let (ang, frac) = touch_geometry(zone, idx);
+                let tc = (self.cx + self.r_cols * frac * ang.cos()).round() as i32;
+                let tr = (self.cy + self.r_rows * frac * ang.sin()).round() as i32;
                 let sc = self.cx + self.r0_cols * ang.cos();
                 let sr = self.cy + self.r0_rows * ang.sin();
                 (tc, tr, sc, sr, self.r0_cols, self.r0_rows)
@@ -512,9 +610,9 @@ impl Renderer {
             if matches!(zone, Zone::C) {
                 return (self.cx as i32, self.cy as i32);
             }
-            let ang = touch_angle(zone, idx);
-            let c = (self.cx + self.inner_cols * ang.cos()).round() as i32;
-            let r = (self.cy + self.inner_rows * ang.sin()).round() as i32;
+            let (ang, frac) = touch_geometry(zone, idx);
+            let c = (self.cx + self.r_cols * frac * ang.cos()).round() as i32;
+            let r = (self.cy + self.r_rows * frac * ang.sin()).round() as i32;
             (c, r)
         } else {
             (self.cx as i32, self.cy as i32)
@@ -533,14 +631,30 @@ fn button_angle(i: u8) -> f32 {
     deg.to_radians()
 }
 
-fn touch_angle(zone: Zone, idx: u8) -> f32 {
+/// Touch sensor ring radius as a fraction of the outer button ring `R`.
+/// A/D share the outer ring (just inside the buttons); E is the middle ring;
+/// B is the inner ring (matches the existing `inner_cols`/`inner_rows`); C is
+/// the center (radius 0).
+fn zone_radius_frac(zone: Zone) -> f32 {
     match zone {
-        Zone::C => 0.0, // center (unused via radius)
-        _ => {
-            // Map touch index 1..8 to the same 8 angles as buttons.
-            let i = idx.clamp(1, 8).max(1);
-            button_angle(i)
-        }
+        Zone::C => 0.0,
+        Zone::B => 0.45,
+        Zone::E => 0.60,
+        Zone::A | Zone::D => 0.80,
+    }
+}
+
+/// Touch sensor geometry: (screen angle, ring-radius fraction) for a zone+index.
+/// A/B sit at the button angles (aligned with the buttons); D/E sit at the
+/// midpoints between buttons (22.5° = π/8 CCW of the same-numbered button).
+/// C returns (0, 0) — callers special-case it to the center.
+fn touch_geometry(zone: Zone, idx: u8) -> (f32, f32) {
+    let i = idx.clamp(1, 8).max(1);
+    let frac = zone_radius_frac(zone);
+    match zone {
+        Zone::C => (0.0, 0.0),
+        Zone::A | Zone::B => (button_angle(i), frac),
+        Zone::D | Zone::E => (button_angle(i) - std::f32::consts::FRAC_PI_8, frac),
     }
 }
 

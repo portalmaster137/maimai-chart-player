@@ -63,20 +63,35 @@ Dependencies: `rodio` (symphonia-mp3), `crossterm`, `clap` (derive).
   cardinals** so no button sits at top/right/bottom/left — clockwise with 1-4 on
   the right half and 5-8 on the left half, mirrored across both axes:
   `  8 1  / 7   2 / 6  C  3 / 5 4  ` (each pair straddles the cardinal, none on it).
-  Touch zones on a smaller inner ring at the same 8 angles (simplification). C at center.
+- **Touch sensor zones** emulate maimai DX's 5 concentric zone groups (34
+  sensors): A (outer, aligned with buttons), B (inner, aligned with buttons),
+  D (outer, *between* buttons), E (middle, *between* buttons), C (center). The
+  static layer draws 4 concentric reference rings — outer button ring `.` /
+  A·D ring `·` (0.80·R) / E ring `∘` (0.60·R) / B ring `,` (0.45·R) — plus the
+  `C` marker. Each touch note renders at its zone's radius × angle:
+  - A_i, B_i at `button_angle(i)` (the 8 button angles).
+  - D_i, E_i at `button_angle(i) − π/8` (the midpoints between buttons → the
+    cardinal/inter-cardinal directions in our 22.5°-offset layout).
+  - C at the center (radius 0).
+  Radii (0.80 / 0.60 / 0.45 of R) are terminal approximations of maimai's true
+  sensor radii; A and D share the 0.80·R ring at alternating angles.
 - Outward travel: window `W = BASE/speed` (BASE tuned so speed 5 ≈ 1.2s).
   progress `p=(now-(t-W))/W`; pos = lerp(inner_for_button, button_pos, p).
   Flash at p≈1 for FLASH secs, then fade.
 - **Notes are filled circle discs** (`put_disc`, 2:1 aspect), sized up:
   tap/ex `●` r=1.2, break `●` r=1.5, star `★` r=1.3, touch `●` r=1.0, flash `◉` r=1.7.
   Dim trail disc behind while approaching.
-- **Holds extend as a retracting bar.** During `[time, end]` a bar of filled discs
-  runs from the button inward toward the (near-center) spawn point. Its length =
-  remaining hold fraction (`frac = 1 - p`, `p = (now-time)/(end-time)`): full at
-  the hit, retracts to a stub at the button as the hold elapses, gone at `end`.
-  Thickness ≈ 0.7× the note radius (break bars are thicker/orange). The button cell
-  itself is left to the head disc (or the flash glyph during the brief hit flash),
-  so the bar reads as a tail extending the note, not a separate marker.
+- **Holds grow during approach then retract.** The hold bar appears the moment
+  the note spawns and grows with the approaching head: during `[time-window,
+  time]` the bar grows from the (near-center) spawn point toward the button
+  (`frac = p_a`, `p_a = (now-(time-window))/window`), with the head disc at its
+  tip (drawn by `draw_tap` at `lerp(spawn, button, p_a)`). At hit the bar is full
+  (spawn→button) under the flash. During `[time, end]` the bar retracts toward
+  the button (`frac = 1 - p`, `p = (now-time)/(end-time)`) — the inner end pulls
+  from spawn toward the button — reaching zero at `end`. After the flash a head
+  disc is sustained at the button through `end`. Thickness ≈ 0.7× the note
+  radius (break bars are thicker/orange). Ring holds only (`Kind::Hold`); touch
+  holds use the rainbow-body arm below.
 - **Color scheme** (`note_color`, priority order):
   1. break → **orange** (256-color `\x1b[38;5;208m`) — always, even if simultaneous.
   2. simultaneous (≥2 notes at the same `time`) → **yellow** (`\x1b[93m`).
@@ -110,19 +125,43 @@ Dependencies: `rodio` (symphonia-mp3), `crossterm`, `clap` (derive).
   - `pp`/`qq` CUP: same as `p`/`q` but inner-ring radius `0.60·R` (bigger loop).
   - `s`/`z` thunder zigzag: 3-segment polyline `B(from)→P1→P2→B(to)` with
     perpendicular offset `0.25·|chord|`; `s` bulges one way, `z` mirrored.
-  - `w` fan/WiFi: stem `B(from)→B(to−1)` then a ring arc `B(to−1)→B(to+1)`
-    through `to` (the short 90° sweep covering 3 lanes).
+  - `w` fan/WiFi: **three rays that expand simultaneously** from `B(from)` to
+    the three consecutive sensors `B(to−1)`, `B(to)`, `B(to+1)` — the star splits
+    at the source and the fan opens like a hand fan. Straight chord rays (not
+    the old stem+arc). See "Fan slides" below.
   Arc tangent for arrow orientation: `(−rc·sin a·da, rr·cos a·da)` with
   `da = a1−a0`. These are terminal approximations of maimai's true curves
-  (especially `w`/`p`/`q`/`pp`/`qq`/`s`/`z`), but each now renders its
+  (especially `p`/`q`/`pp`/`qq`/`s`/`z`), but each now renders its
   distinctive shape instead of collapsing to a straight chord.
+- **Fan slides (`w`) split into three expanding rays** — they do *not* use the
+  single-path trace. `draw_fan` (called from the `Kind::Slide` arm for
+  `SlideShape::W` instead of `draw_slide_leg`) draws three straight chord rays
+  from `B(from)` to `B(to−1)`, `B(to)`, `B(to+1)` (`wrap1_8` for the 1..=8
+  wrap). Three phases mirror the slide fade-in/trace model:
+  1. **Fade-in** `[motion_start−FADE_IN, motion_start]`: all three full rays
+     appear dimly (gray→dim color) plus a dim `★` hub at the source.
+  2. **Expand** `[motion_start, motion_end]`: three heads travel outward
+     simultaneously. Each ray is **bright** (`head_color`) from source→tip and
+     **dim** (`dim(head_color)`) from tip→destination; a `★` head rides each
+     tip. `p = (now−motion_start)/(motion_end−motion_start)` → all three tips at
+     `lerp(source, dest_i, p)`. The fan visibly opens.
+  3. **Fully open** `[motion_end, motion_end+FLASH]`: hold the full bright fan
+     and flash a big `✦` disc (`FLASH_R`) at each of the three destination
+     sensors — the "landed on three sensors" climax. After that, nothing.
+  Rays are thick filled `●` bars (`draw_bar`, `RAY_R=0.9`) so the fan reads as
+  a bold solid shape; a bright `★` hub marks the pivot. Color is `head_color`
+  (blue star / orange break / yellow simultaneous), so break fans are orange
+  and simultaneous fans are yellow with no extra wiring.
 - **Touch notes are shutters, not center travelers.** A touch appears at its own
   zone position as a small square shutter: four pyramids (▲▼◀▶) around the hit
   point that close in as `p→1` (open at the square's edges, tips meet at hit),
   then briefly hold closed and go away. The appear→close window is `BASE/speed`,
   so faster speed = shorter shutter (speed 1 ≈ 6s, speed 5 ≈ 1.2s, speed 10 ≈
-  0.6s). Plain touches are blue (or yellow if simultaneous/firework). Touch holds
-  close the shutter at hit, then sustain an `h` disc through `[t, end]`.
+  0.6s). During approach the shutter is colored (blue, or yellow if
+  simultaneous/firework). **At the hit moment** (`now ∈ [t, t+FLASH]`) the closed
+  shutter flashes **white** (`\x1b[97m`) as a "hit now" border, replacing the
+  approach color. Touch holds close the shutter at hit, then sustain an `h` disc
+  through `[t, end]`.
 - **Touch holds are rainbow with a clockwise timer ring.** They approach like a
   touch tap (closing shutter), then during `[time, end]` a big rainbow body sits
   at the touch point and a ring sweeps clockwise from the top (12 o'clock) as a
@@ -156,6 +195,10 @@ Dependencies: `rodio` (symphonia-mp3), `crossterm`, `clap` (derive).
       center, `V` L through turning button, `p`/`q`/`pp`/`qq` U/CUP loops on
       inner ring, `s`/`z` thunder zigzag, `w` fan/WiFi stem+arc sweep)
 - [x] render: touch zones (inner ring, green + / yellow F firework)
+- [x] render: 5 touch sensor zones emulated at distinct radii/angles
+      (A outer 0.80·R + B inner 0.45·R at button angles; D outer 0.80·R + E middle
+      0.60·R at the midpoint/cardinal angles; C center) with 4 concentric
+      reference rings drawn on the static layer
 - [x] player: rodio audio playback + master clock (audio optional via --no-audio)
 - [x] player: 60fps sync loop + key handling + terminal restore (TermGuard)
 - [x] integrate main.rs, tune BASE/FLASH/speed (BASE=6 → speed5≈1.2s)
@@ -174,9 +217,19 @@ Dependencies: `rodio` (symphonia-mp3), `crossterm`, `clap` (derive).
       clockwise, equal 45° spacing, symmetric (no button at N/E/S/W)
 - [x] holds extend as a retracting bar (button → near-center) instead of an `H`
       marker; length = remaining hold fraction, thick/orange for break
+- [x] holds grow during approach (bar appears the moment the note spawns and
+      grows with the head from spawn→button), full at hit, retract during hold
 - [x] touch holds: rainbow body at the touch point (center C usually) + a small
       ring sweeping clockwise from top as a hold-duration indicator (24-step
       256-color rainbow wheel)
+- [x] touch taps: white border at the hit moment — the closed shutter flashes
+      bright white (`\x1b[97m`) during `[t, t+FLASH]` to mark when to hit;
+      approach stays blue/yellow
+- [x] fan (`w`) slides: split into three rays that expand simultaneously from
+      the source button to sensors `to−1`/`to`/`to+1` (a big opening fan), with
+      fade-in → expand → fully-open `✦` flashes at the three destinations;
+      thick `●` rays + `★` hub/heads; color via `head_color` (orange break /
+      yellow simultaneous / blue star)
 
 ## Verification status
 - Parser: all 5 difficulties parse with **0 warnings** (STD 588 / HRD 980 / MAST 1265
@@ -202,16 +255,45 @@ Dependencies: `rodio` (symphonia-mp3), `crossterm`, `clap` (derive).
   junction. `--dump -d 6` confirms the `V` turning digit parses (`2V46` →
   `turn: 4, to: 6`) and `^`/`AutoCircle` parses. No `s`/`z`/`^`/`p`/`q`/`qq` in
   the test chart, so those shapes are verified by geometry/code review only.
+- **Touch zones + holds verified via `--demo`** (temp `DEMO_NOW` hook, since
+  removed): UPR at t=132.46 (simultaneous A2/A3/B2/B3/D3/E3) shows shutters at
+  the correct per-zone positions — A outer near buttons 2/3, B inner, D outer at
+  cardinal-east, E middle at cardinal-east — and the 4 concentric rings
+  (outer `.` / A·D `·` / E `∘` / B `,`) render. MAST break hold `1bh[1:2]`
+  (t=4, end=8): bar half-grown toward button 1 at `now=3.4` (mid-approach), full
+  + flash at `now=4.0`, half-retracted at `now=6.0`, gone at `now=8.0`.
+- **Touch hit white border verified via `--demo`** (temp `DEMO_NOW` hook, since
+  removed): UPR simultaneous touches at t=132.46024 — approach frame `now=132.40`
+  emits yellow `\x1b[93m` shutters (simultaneous) with no white; hit frame
+  `now=132.46024` emits white `\x1b[97m` shutters (9 codes) with no yellow. The
+  16-touch group at t=153.54 hits with 17 white codes. Single touch at t=26.7604
+  hits with 3 white codes. White appears only in `[t, t+FLASH]`.
+- **Fan (`w`) slides verified via `--demo`** (temp `DEMO_NOW` hook, since
+  removed): REIM `-d 5` long `1w5` (t=155.952, motion [156.327, 158.684],
+  from=1, dests 4/5/6) — `now=156.0` shows the fade-in (three faint full rays +
+  dim `★` hub at button 1); `now=157.5` (p≈0.5) shows three bright half-rays
+  from button 1 reaching midway to buttons 4/5/6 with dim remainder ahead and
+  `★` heads at the tips; `now=158.7` shows the fully-open fan — three bright
+  full rays 1→4/5/6 with big `✦` flashes at the destination sensors; `now=158.9`
+  (past `motion_end+FLASH`) the fan is gone. The simultaneous `1w5`+`8w4` pair
+  at t=155.952 renders yellow (both simultaneous); UPR break fan `3bw7`
+  (t=208.504) renders orange (`\x1b[38;5;208m`) — color flows from `head_color`,
+  no fan-specific wiring.
 
 ## Known simplifications
 - Touch zones mapped to inner ring at button angles (not exact maimai geometry).
+  Now superseded: zones use distinct radii (A/D 0.80·R, E 0.60·R, B 0.45·R, C 0)
+  and two angle sets (button angles for A/B, midpoint/cardinal angles for D/E),
+  but the radii are terminal approximations of maimai's true sensor radii and
+  D/E's π/8 offset is the spec's "22.5° CCW of the same-numbered button".
 - Slide path shapes are terminal approximations of maimai's true curves:
   `>`/`<`/`^`/`-` are exact (ring arc / chord); `v`/`V` are exact polylines;
   `p`/`q`/`pp`/`qq` model the loop as an inner-ring arc at the directed distance
   (radius 0.30·R / 0.60·R) rather than the true maimai U/CUP spline; `s`/`z` are
-  a 3-segment zigzag with a fixed 0.25·|chord| offset; `w` is a stem + 90° ring
-  sweep (3 lanes) rather than the true fan spline. Each renders its distinctive
-  shape instead of collapsing to a straight chord.
+  a 3-segment zigzag with a fixed 0.25·|chord| offset. (`w` fans now render as
+  three straight expanding rays — the accurate fan shape, no longer the old
+  stem+90°-sweep approximation.) Each renders its distinctive shape instead of
+  collapsing to a straight chord.
 - Seek/scrub not supported in v1 (mp3 decode seek is non-trivial).
 
 ## Gotchas
