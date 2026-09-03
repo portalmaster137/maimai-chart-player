@@ -11,6 +11,7 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::execute;
 use rodio::{Decoder, OutputStream, Sink};
 
+use crate::bg::Bg;
 use crate::chart::NoteEvent;
 use crate::maidata::Maidata;
 use crate::render::{Hud, Renderer};
@@ -27,6 +28,7 @@ pub fn run(
     md: &Maidata,
     events: &[NoteEvent],
     track: &Path,
+    bg: &mut Bg,
     cfg: PlayerConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (term_w, term_h) = terminal::size().unwrap_or((80, 24));
@@ -106,12 +108,17 @@ pub fn run(
 
         // Adapt to terminal resize: if the size changed since the last frame,
         // rebuild the renderer at the new dimensions.
-        if let Ok((tw, th)) = terminal::size()
-            && (tw, th) != last_size
-        {
+        let (tw, th) = terminal::size().unwrap_or(last_size);
+        if (tw, th) != last_size {
             let (cw, ch) = canvas_dims(tw, th);
             renderer = Renderer::new(cw, ch);
             last_size = (tw, th);
+        }
+        let (cw, ch) = canvas_dims(tw, th);
+        // Push a fresh backdrop into the renderer when one is due (level
+        // change, resize, or a new video frame).
+        if let Some(layer) = bg.layer(cw, ch) {
+            renderer.set_bg_layer(layer);
         }
 
         let hud = Hud {
@@ -123,6 +130,7 @@ pub fn run(
             speed,
             paused,
             muted,
+            bg: bg.level(),
         };
 
         let frame = renderer.frame(events, now, speed, &hud);
@@ -161,6 +169,8 @@ pub fn run(
                             s.set_volume(if muted { 0.0 } else { volume });
                         }
                     }
+                    // Cycle the background dim level 0→1→…→10→0 (0 = off).
+                    (KeyCode::Char('b'), _) => bg.set_level((bg.level() + 1) % 11),
                     _ => {}
                 }
             }

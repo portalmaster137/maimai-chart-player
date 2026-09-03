@@ -24,6 +24,7 @@ src/
   simai.rs    # tokenize + parse simai note grammar -> NoteEvent list
   chart.rs    # NoteEvent/Kind/Position model; timing resolution walk
   render.rs   # ASCII circle canvas + per-frame note drawing
+  bg.rs       # background art (bg.png/jpg/mp4) -> dim ASCII backdrop layer
   player.rs   # master clock, audio start, sync/render loop, key handling
 ```
 Dependencies: `rodio` (symphonia-mp3), `crossterm`, `clap` (derive).
@@ -66,8 +67,9 @@ Dependencies: `rodio` (symphonia-mp3), `crossterm`, `clap` (derive).
 - **Touch sensor zones** emulate maimai DX's 5 concentric zone groups (34
   sensors): A (outer, aligned with buttons), B (inner, aligned with buttons),
   D (outer, *between* buttons), E (middle, *between* buttons), C (center). The
-  static layer draws 4 concentric reference rings — outer button ring `.` /
-  A·D ring `·` (0.80·R) / E ring `∘` (0.60·R) / B ring `,` (0.45·R) — plus the
+  static layer draws 4 concentric reference rings — outer button ring `.`
+  (**white** so it reads against the bg backdrop) / A·D ring `·` (0.80·R) /
+  E ring `∘` (0.60·R) / B ring `,` (0.45·R) — plus the
   `C` marker. Each touch note renders at its zone's radius × angle:
   - A_i, B_i at `button_angle(i)` (the 8 button angles).
   - D_i, E_i at `button_angle(i) − π/8` (the midpoints between buttons → the
@@ -175,9 +177,56 @@ Dependencies: `rodio` (symphonia-mp3), `crossterm`, `clap` (derive).
   red→orange→yellow→green→cyan→blue→magenta).
 
 ## CLI
-`maimai-player <DIR> [-d <N>] [--offset <secs>] [--speed <1-10>]`
-- No `-d` → interactive numbered menu (level + charter). Defaults: speed 5, offset 0.
-- Keys: `q`/Esc quit, `+`/`-` offset nudge, `↑`/`↓` speed, `p` pause, `m` mute.
+`maimai-player <DIR> [-d <N>] [--offset <secs>] [--speed <1-10>] [--bg <0-10>] [--bg-style <ramp|cells>]`
+- No `-d` → interactive numbered menu (level + charter). Defaults: speed 5, offset 0, bg 5, bg-style ramp.
+- Keys: `q`/Esc quit, `+`/`-` offset nudge, `↑`/`↓` speed, `p` pause, `m` mute, `b` cycle bg level (0→1→…→10→0).
+
+## Background art (bg.rs)
+- **Detection** (`Bg::detect`, in `main.rs` *before* the alternate screen so warnings
+  are visible): candidates in order bg.mp4/.webm/.mov/.avi (video preferred), then
+  bg.png/.jpg/.jpeg. `--bg 0` skips detection entirely. Never fails — one stderr
+  warning, then a disabled `Bg`.
+- **Composition**: `Renderer::set_bg_layer` installs a `bg_layer` of `Cell`s
+  (width×height) with the static ring/label glyphs stamped on top; `frame()` clones
+  `bg_layer` instead of `static_layer` when non-empty. Painter order stays
+  **bg → notes**: `put`/`put_disc` overwrite only `ch`+fg (preserving any cell
+  background), so notes and rings paint on top of the backdrop.
+- **Char-ramp style** (`--bg-style ramp`): luminance
+  (Rec.709) → `RAMP = [' ','.',',',':',';','-','=','+','*','#','%','@']` (12 levels
+  matching `GRAYS`, codes 232..=243 — all darker than `Color::Dim` #7f7f7f, so
+  rings/labels and dim trails stay legible). `max_index(level) = 11*level/10` (min
+  1): level 5 caps at code 237, level 10 reaches 243. Mapping:
+  `lum^0.9 * 0.95 + 0.02` scaled — black stays blank (ramp index 0 = space).
+- **Truecolor-cells style** (`--bg-style cells`, needs a 24-bit-color terminal):
+  space chars with dimmed truecolor painted into `Cell.bg` (`Option<[u8; 3]>`).
+  `--bg` scales brightness linearly (level 10 ≈ 45% of original), then each channel
+  is quantized to 5 bits (`& 0xF8 | 0x04`) so neighbors merge into longer SGR runs
+  (a per-cell 24-bit escape every frame is expensive to emit). Frame emission
+  tracks fg and bg separately: default fg mid-row is `\x1b[39m` (never `\x1b[0m`,
+  which would wipe the bg), bg changes emit `\x1b[48;2;r;g;bm` / `\x1b[49m`, and
+  `\x1b[49m` precedes each row's `\x1b[K` so the 1-col safety margin erases with
+  terminal-default background. Output is ~3× the ramp style (~30KB/frame).
+- **2:1 char aspect**: the pixel buffer is `w × 2h` (each cell = 2 vertical
+  pixels); `cells_from_pixels(px, pw, ph, cw, ch, bpp, level, style)` averages each
+  cell's source-space pixel block (`bpp`: 4 = RGBA with alpha composited over
+  black, 3 = rgb24 from the video pipe) and dispatches on `BgStyle`.
+- **Images**: `image` crate (png+jpeg features), `DynamicImage::resize_to_fill`
+  cover-crop, cached per canvas size → zero per-frame cost.
+- **Video** (ffmpeg CLI, no video crates): spawned per canvas size as
+  `ffmpeg -hide_banner -loglevel error -nostdin -re -an -sn -dn -i bg.mp4 -vf
+  fps=12,scale=W:2H:force_original_aspect_ratio=increase,crop=W:2H -f rawvideo
+  -pix_fmt rgb24 pipe:1` with **stdin/stderr nulled** (inheriting the raw-mode TTY
+  would steal keystrokes). A reader thread `read_exact`s frame-sized chunks into
+  `Arc<Mutex<Slot{frame, seq, ended}>>`; the 60fps loop re-converts only when
+  `seq` changes (~12 Hz). `-re` streams at native rate (without it ffmpeg dumps
+  the whole file instantly and the "animation" is over in a blink). Resize kills +
+  respawns the pipe; `Drop` kills + waits (no zombie). Missing ffmpeg or pipe
+  failure → one warning, play without bg. Pause freezes the video for free (the
+  loop stops draining the pipe, ffmpeg blocks on write).
+- **Style switch**: `BgStyle::CharRamp | TruecolorBg` (`--bg-style ramp|cells`).
+- The player pushes `bg.layer(cw, ch)` into the renderer every frame when `Some`
+  (level change, resize, or new video frame); `Bg` tracks `last_dims` so a resize
+  always re-pushes to the freshly rebuilt `Renderer`.
 
 ## Progress checklist
 - [x] Scaffold + Cargo.toml + STATE.md (cargo build clean)
@@ -230,6 +279,15 @@ Dependencies: `rodio` (symphonia-mp3), `crossterm`, `clap` (derive).
       fade-in → expand → fully-open `✦` flashes at the three destinations;
       thick `●` rays + `★` hub/heads; color via `head_color` (orange break /
       yellow simultaneous / blue star)
+- [x] background art (bg.rs): bg.png/jpg cover-cropped to a dim grayscale
+      char-ramp backdrop (codes 232..=243) behind the notes; bg.mp4/webm/mov/avi
+      decoded via an ffmpeg rawvideo pipe (12fps, `-re` real-time, stdin/stderr
+      nulled, reader thread + respawn on resize, Drop kills the child);
+      `--bg 0-10` dim level + `b` key cycling + HUD label
+- [x] bg style switch: `--bg-style ramp` (grayscale chars) and `--bg-style cells`
+      (dimmed 5-bit-quantized truecolor painted into cell backgrounds; needs a
+      24-bit-color terminal) — fg emission uses `\x1b[39m` mid-row and `\x1b[49m`
+      precedes `\x1b[K` so cell backgrounds survive; `put` preserves cell bg
 
 ## Verification status
 - Parser: all 5 difficulties parse with **0 warnings** (STD 588 / HRD 980 / MAST 1265
@@ -280,6 +338,27 @@ Dependencies: `rodio` (symphonia-mp3), `crossterm`, `clap` (derive).
   (t=208.504) renders orange (`\x1b[38;5;208m`) — color flows from `head_color`,
   no fan-specific wiring.
 
+- **Background art (bg.rs) verified via `--demo` + pty runs**: image path emits
+  ~530 gray SGR runs per frame (run-length compressed, not per-cell); `--bg 0`
+  emits zero gray codes and skips detection (no ffmpeg probe even with bg.mp4
+  present); `--bg 1` uses only codes 232/233; `--bg 10` reaches 242 (243 only
+  for near-white pixels; the test jacket's brightest cell lands at index 10).
+  Note-glyph positions are byte-identical with and without bg (only the HUD
+  `bg N` label differs). Video path: an ffmpeg-generated fixture (`ffmpeg -loop
+  1 -i bg.png -t 8 -r 24 -pix_fmt yuv420p /tmp/bg.mp4`) decodes ~594 gray runs
+  into the demo frame; live pty run shows continuous bg streaming, `b` cycling
+  the HUD label 5→6→7, and clean exit with no leftover ffmpeg processes.
+  `PATH=/usr/bin/nonexistent` under a pty: one warning, playback continues with
+  no bg. Unknown `--bg-style` values are a clap error.
+- **Truecolor-cells mode verified via `--demo`**: `--bg-style cells` emits only
+  `\x1b[48;2;r;g;bm` bg codes (zero gray fg codes) while `ramp` emits only gray
+  fg codes (zero bg codes) — the styles never mix. Bg runs scale with level
+  (bg1: 32 runs / 4 distinct colors ≈ 4.5 avg brightness → bg5: 324/19 → bg10:
+  498/45 ≈ 15.5), every canvas row ends `\x1b[49m\x1b[K`, note-glyph positions
+  are byte-identical with and without the backdrop, and `--bg 0` emits nothing.
+  Live pty run in cells mode with the video fixture: ~30KB/frame streamed
+  continuously, `b` cycles the HUD label, clean exit, no ffmpeg zombies.
+
 ## Known simplifications
 - Touch zones mapped to inner ring at button angles (not exact maimai geometry).
   Now superseded: zones use distinct radii (A/D 0.80·R, E 0.60·R, B 0.45·R, C 0)
@@ -295,12 +374,25 @@ Dependencies: `rodio` (symphonia-mp3), `crossterm`, `clap` (derive).
   stem+90°-sweep approximation.) Each renders its distinctive shape instead of
   collapsing to a straight chord.
 - Seek/scrub not supported in v1 (mp3 decode seek is non-trivial).
+- Background video is not seek-synced to the song clock (frames stream from
+  playback start; after the video ends the last frame freezes as a still).
+  The char-ramp backdrop is a plain luminance quantization, not dithered.
+- `--bg-style cells` assumes a 24-bit-color terminal (no capability detection,
+  same as the existing 256-color assumption) and quantizes to 5 bits/channel
+  rather than dithering.
 
 ## Gotchas
 - Inline `(BPM)` mid-measure changes step duration for subsequent slots.
 - `{384}` / `{96}` long-hold measures with embedded events in later commas.
 - `*`-chained and multi-point slides; free-form `[s##s]` timings — warn + approximate.
 - No `&first` → chart t=0 = audio start; `--offset` shifts (live `+`/`-` nudge).
+- ffmpeg bg pipe: stdin MUST be nulled (inheriting the raw-mode TTY steals
+  keystrokes) and `-re` is required for real-time streaming. `read_exact` on an
+  empty buffer is a no-op — refill the scratch buffer after each `mem::swap` or
+  the reader spins on zero-byte reads.
+- Video decode ends silently (`ended` flag); `new_frame_ready` must NOT gate on
+  it, or the final frames (which arrived before EOF) never display.
 
 ## Future
-Seek/scrub, judgements, chart scrubbing, record/replay, SFX, jacket image (bg.png).
+Seek/scrub, judgements, chart scrubbing, record/replay, SFX, bg capability
+detection, dithered/colored bg styles.

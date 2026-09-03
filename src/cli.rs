@@ -25,6 +25,16 @@ pub struct Cli {
     #[arg(long, default_value_t = 5)]
     pub speed: u8,
 
+    /// Background art dim level 0..=10 (0 = off). Auto-detects bg.png/jpg/mp4
+    /// in DIR; `b` cycles the level during playback.
+    #[arg(long, default_value_t = 5)]
+    pub bg: u8,
+
+    /// Background rendering style: "ramp" (dim grayscale chars) or "cells"
+    /// (truecolor cell backgrounds, not implemented yet).
+    #[arg(long, default_value = "ramp")]
+    pub bg_style: String,
+
     /// Dump the first N resolved events to stderr and exit (no playback).
     #[arg(long, num_args = 0..=1, default_missing_value = "20")]
     pub dump: Option<usize>,

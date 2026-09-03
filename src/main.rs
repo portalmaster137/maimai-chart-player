@@ -1,5 +1,6 @@
 //! MaiMai terminal chart player entry point.
 
+mod bg;
 mod chart;
 mod cli;
 mod maidata;
@@ -29,6 +30,14 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     if !track_path.exists() {
         return Err(format!("track.mp3 not found in {}", cli.dir.display()).into());
     }
+
+    // Detect background art while stderr is still on the normal screen, so any
+    // "no background" warning is visible before the alternate screen opens.
+    let bg_style = match bg::BgStyle::parse(&cli.bg_style) {
+        Some(s) => s,
+        None => return Err(format!("unknown --bg-style {:?} (use \"ramp\" or \"cells\")", cli.bg_style).into()),
+    };
+    let mut bg = bg::Bg::detect(&cli.dir, cli.bg, bg_style);
 
     let diff = match choose_difficulty(&md, cli.difficulty) {
         Some(d) => d,
@@ -63,7 +72,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if cli.demo {
-        return render_demo(&events);
+        return render_demo(&events, &mut bg);
     }
     eprintln!("press q/Esc to quit. starting in 1s...");
     std::thread::sleep(std::time::Duration::from_secs(1));
@@ -72,6 +81,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         &md,
         &events,
         &track_path,
+        &mut bg,
         PlayerConfig {
             offset: cli.offset,
             speed: cli.speed,
@@ -84,12 +94,22 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Render a single demo frame to stdout without audio or raw-mode terminal.
 /// Picks events near a chosen `now` so the circle shows approaching + hit notes.
-fn render_demo(events: &[chart::NoteEvent]) -> Result<(), Box<dyn std::error::Error>> {
+fn render_demo(events: &[chart::NoteEvent], bg: &mut bg::Bg) -> Result<(), Box<dyn std::error::Error>> {
     use chart::{Kind, Position};
     use render::{Hud, Renderer};
     use std::time::Instant;
 
-    let renderer = Renderer::new(74, 26);
+    let mut renderer = Renderer::new(74, 26);
+    // A video source needs a moment for its first frame to cross the pipe;
+    // stills are immediate. Poll briefly, then give up silently (--demo must
+    // never hang or fail just because the background is missing/slow).
+    for _ in 0..50 {
+        if let Some(layer) = bg.layer(74, 26) {
+            renderer.set_bg_layer(layer);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     // Find a `now` where there's a good mix of activity (first slide + taps).
     let now = 4.6; // during the MAST intro: holds + E-touches + approaching taps
     let _ = Position::Button(1);
@@ -104,6 +124,7 @@ fn render_demo(events: &[chart::NoteEvent]) -> Result<(), Box<dyn std::error::Er
         speed: 5,
         paused: false,
         muted: false,
+        bg: if bg.enabled() { bg.level() } else { 0 },
     };
     let frame = renderer.frame(events, now, 5, &hud);
     print!("{frame}");

@@ -1,10 +1,12 @@
 //! ASCII circle renderer. Notes spawn near the center and travel outward to
 //! their button on the outer ring, flashing at hit time.
 
+use std::fmt::Write as _;
+
 use crate::chart::{Kind, NoteEvent, Position, SlideShape, StarKind, Zone};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Color {
+pub(crate) enum Color {
     Default,
     Dim,       // gray (ring / labels)
     Pink,      // default tap notes
@@ -15,6 +17,7 @@ enum Color {
     Yellow,    // simultaneous (≥2 at same time) + firework
     White,     // touch-note hit border (bright white)
     Rainbow(u8), // touch-holds: index into RAINBOW (24-step hue wheel)
+    Gray(u8),  // background art: index into GRAYS (dark 256-color grays)
 }
 
 // 24-step 256-color hue wheel (red → orange → yellow → green → cyan → blue →
@@ -26,6 +29,15 @@ const RAINBOW: [&str; 24] = [
     "\x1b[38;5;51m",  "\x1b[38;5;45m",  "\x1b[38;5;39m",  "\x1b[38;5;33m",
     "\x1b[38;5;27m",  "\x1b[38;5;21m",  "\x1b[38;5;57m",  "\x1b[38;5;93m",
     "\x1b[38;5;129m", "\x1b[38;5;165m", "\x1b[38;5;201m", "\x1b[38;5;198m",
+];
+
+// 12-step dark-gray ramp (256-color codes 232..=243, #080808 → #5e5e5e), used for
+// background art. Every entry is darker than Color::Dim (#7f7f7f), so the static
+// rings/labels and dim note trails stay legible on top of the backdrop.
+const GRAYS: [&str; 12] = [
+    "\x1b[38;5;232m", "\x1b[38;5;233m", "\x1b[38;5;234m", "\x1b[38;5;235m",
+    "\x1b[38;5;236m", "\x1b[38;5;237m", "\x1b[38;5;238m", "\x1b[38;5;239m",
+    "\x1b[38;5;240m", "\x1b[38;5;241m", "\x1b[38;5;242m", "\x1b[38;5;243m",
 ];
 
 impl Color {
@@ -41,6 +53,7 @@ impl Color {
             Color::Yellow => "\x1b[93m",
             Color::White => "\x1b[97m",
             Color::Rainbow(i) => RAINBOW[(i as usize) % RAINBOW.len()],
+            Color::Gray(i) => GRAYS[(i as usize).min(GRAYS.len() - 1)],
         }
     }
 }
@@ -52,15 +65,29 @@ fn rainbow_color(t: f32) -> Color {
     Color::Rainbow(i as u8)
 }
 
+/// Foreground SGR for use mid-row. Unlike `Color::Default.ansi()` (`\x1b[0m`, a
+/// full reset that would also clear an active cell background), default fg is
+/// `\x1b[39m`.
+fn fg_sgr(c: Color) -> &'static str {
+    match c {
+        Color::Default => "\x1b[39m",
+        other => other.ansi(),
+    }
+}
+
 #[derive(Clone, Copy)]
-struct Cell {
-    ch: char,
-    color: Color,
+pub(crate) struct Cell {
+    pub(crate) ch: char,
+    pub(crate) color: Color,
+    /// Truecolor cell background (the `--bg-style cells` backdrop). None =
+    /// terminal default. Notes/rings overwrite only `ch`/`color`, so they keep
+    /// painting on top of the backdrop color.
+    pub(crate) bg: Option<[u8; 3]>,
 }
 
 impl Default for Cell {
     fn default() -> Self {
-        Cell { ch: ' ', color: Color::Default }
+        Cell { ch: ' ', color: Color::Default, bg: None }
     }
 }
 
@@ -74,6 +101,7 @@ pub struct Hud {
     pub speed: u8,
     pub paused: bool,
     pub muted: bool,
+    pub bg: u8,
 }
 
 const BASE: f32 = 6.0; // approach window = BASE / speed  (speed 5 → 1.2s)
@@ -106,6 +134,9 @@ pub struct Renderer {
     r0_cols: f32,
     r0_rows: f32,
     static_layer: Vec<Cell>,
+    /// Full-canvas backdrop (background art with the static glyphs stamped on
+    /// top), pushed via `set_bg_layer`. Empty = no backdrop (clone static_layer).
+    bg_layer: Vec<Cell>,
     /// Button index (1..=8) -> (col, row).
     button_pos: [(i32, i32); 9],
 }
@@ -143,7 +174,7 @@ impl Renderer {
         // Concentric reference rings: outer button ring + the 3 touch sensor
         // rings (A/D outer ~0.80R, E middle ~0.60R, B inner ~0.45R), matching
         // the 5 maimai touch zones (C is the center marker drawn next).
-        draw_ellipse(&mut static_layer, width, height, cx, cy, r_cols, r_rows, '.', Color::Dim);
+        draw_ellipse(&mut static_layer, width, height, cx, cy, r_cols, r_rows, '.', Color::White);
         draw_ellipse(&mut static_layer, width, height, cx, cy, r_cols * 0.80, r_rows * 0.80, '·', Color::Dim); // A/D
         draw_ellipse(&mut static_layer, width, height, cx, cy, r_cols * 0.60, r_rows * 0.60, '∘', Color::Dim); // E
         draw_ellipse(&mut static_layer, width, height, cx, cy, r_cols * 0.45, r_rows * 0.45, ',', Color::Dim); // B
@@ -165,13 +196,36 @@ impl Renderer {
             r0_cols,
             r0_rows,
             static_layer,
+            bg_layer: Vec::new(),
             button_pos,
         }
     }
 
+    /// Install a full-canvas backdrop layer. `bg` must be `width*height` cells
+    /// sized for this renderer (built by `bg::Bg::layer`). The static glyphs
+    /// (rings, digits, `C`) are stamped on top so they stay visible over the
+    /// art; notes then overwrite cells painter-style as usual.
+    pub fn set_bg_layer(&mut self, bg: Vec<Cell>) {
+        let mut merged = bg;
+        for (dst, src) in merged.iter_mut().zip(self.static_layer.iter()) {
+            if src.ch != ' ' {
+                // Stamp the static glyph but keep the backdrop bg under it.
+                dst.ch = src.ch;
+                dst.color = src.color;
+            }
+        }
+        self.bg_layer = merged;
+    }
+
     /// Build the frame as a single string with ANSI colors.
     pub fn frame(&self, events: &[NoteEvent], now: f32, speed: u8, hud: &Hud) -> String {
-        let mut cells = self.static_layer.clone();
+        // With a backdrop installed, bg_layer already has the static glyphs
+        // stamped on top, so the painter order (bg → notes) is unchanged.
+        let mut cells = if self.bg_layer.is_empty() {
+            self.static_layer.clone()
+        } else {
+            self.bg_layer.clone()
+        };
         let window = BASE / speed as f32;
 
         // Mark notes that hit at the same time as another note (≥2 at the same
@@ -187,41 +241,59 @@ impl Renderer {
         // `\n` advances one row but keeps the column → staircase/wrap. CRLF keeps
         // every row anchored at column 1. The very last line gets no newline so we
         // never push the cursor past the bottom row (which would scroll).
-        let mut out = String::with_capacity((self.width * self.height * 3) as usize);
+        let mut out = String::with_capacity((self.width * self.height * 6) as usize);
         out.push_str("\x1b[H"); // cursor home
         let mut last_color = Color::Default;
+        let mut last_bg: Option<[u8; 3]> = None;
         for row in 0..self.height {
             for col in 0..self.width {
                 let cell = &cells[(row * self.width + col) as usize];
                 if cell.color != last_color {
-                    out.push_str(cell.color.ansi());
+                    // Default fg is `\x1b[39m` mid-row, NOT `\x1b[0m`: a full
+                    // reset would also wipe the active cell background.
+                    out.push_str(fg_sgr(cell.color));
                     last_color = cell.color;
+                }
+                if cell.bg != last_bg {
+                    match cell.bg {
+                        Some([r, g, b]) => {
+                            let _ = write!(out, "\x1b[48;2;{r};{g};{b}m");
+                        }
+                        None => out.push_str("\x1b[49m"),
+                    }
+                    last_bg = cell.bg;
                 }
                 out.push(cell.ch);
             }
-            out.push_str("\x1b[K"); // clear to end of line (no stale trailing chars)
+            // Reset the background before the erase: `\x1b[K` fills with the
+            // *current* background, and the 1-col safety margin right of the
+            // canvas should stay terminal-default (no wrap risk either way —
+            // the erase prints no character).
+            out.push_str("\x1b[49m\x1b[K"); // clear to end of line
             out.push_str("\r\n");
             out.push_str(Color::Default.ansi());
             last_color = Color::Default;
+            last_bg = None;
         }
         out.push_str(Color::Default.ansi());
 
         // HUD line below the circle (truncated to the canvas width so a long title
         // never wraps onto a second row on narrow terminals).
         let hud_line = format!(
-            " {title}  [{diff}]  BPM {bpm:.0}  t {time:6.1}s  offset {off:+.2}  speed {spd}  {paused}{muted}",
+            " {title}  [{diff}]  BPM {bpm:.0}  t {time:6.1}s  offset {off:+.2}  speed {spd}  bg {bg}  {paused}{muted}",
             title = hud.title,
             diff = hud.difficulty,
             bpm = hud.bpm,
             time = hud.time,
             off = hud.offset,
             spd = hud.speed,
+            bg = hud.bg,
             paused = if hud.paused { "[PAUSED] " } else { "" },
             muted = if hud.muted { "[MUTED] " } else { "" },
         );
         out.push_str(&truncate(&hud_line, self.width as usize));
         out.push_str("\x1b[K\r\n");
-        let keys = " keys: q/Esc quit  +/- offset  Up/Down speed  p pause  m mute";
+        let keys = " keys: q/Esc quit  +/- offset  Up/Down speed  p pause  m mute  b bg";
         out.push_str(&truncate(keys, self.width as usize));
         out.push_str("\x1b[K");
         out
@@ -786,7 +858,10 @@ fn put(cells: &mut [Cell], width: i32, height: i32, c: i32, r: i32, ch: char, co
     }
     let idx = (r * width + c) as usize;
     if idx < cells.len() {
-        cells[idx] = Cell { ch, color };
+        // Overwrite glyph + fg only, preserving any cell background so notes
+        // and rings paint on top of the `--bg-style cells` backdrop.
+        cells[idx].ch = ch;
+        cells[idx].color = color;
     }
 }
 
